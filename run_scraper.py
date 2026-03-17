@@ -4,8 +4,7 @@ Automated Crunchbase scraper using Playwright.
 Logs into Crunchbase, then queries the internal API for angel investor counts per city.
 
 Usage:
-    python3 run_scraper.py --email EMAIL --password PASSWORD
-    python3 run_scraper.py --resume  # skip login, reuse existing browser state
+    python3 run_scraper.py --email EMAIL --password PASSWORD [--headless]
 """
 
 import argparse
@@ -25,12 +24,9 @@ RESULTS_FILE = OUTPUT_DIR / "results.json"
 STATE_FILE = OUTPUT_DIR / "browser_state.json"
 
 ROW_START = 532
-ROW_END = 797
+ROW_END = 1059
 BATCH_SIZE = 25
-DELAY_MIN = 2500
-DELAY_MAX = 3500
 
-# JS code that runs inside the browser for a single batch
 SCRAPE_JS = """
 async (cities) => {
     const DELAY = 2500;
@@ -50,6 +46,7 @@ async (cities) => {
             let best = null, mq = "none";
             for (const q of queries) {
                 const r = await fetch(`/v4/data/autocompletes?query=${encodeURIComponent(q)}&collection_ids=location.cities&limit=10`, {credentials:'include'});
+                if (!r.ok) throw new Error(`HTTP ${r.status}`);
                 const data = await r.json();
                 if (!data.entities || data.entities.length === 0) continue;
                 for (const e of data.entities) {
@@ -76,6 +73,7 @@ async (cities) => {
                     query:[{type:"predicate",field_id:"investor_type",operator_id:"includes",values:["angel"]},
                            {type:"predicate",field_id:"location_identifiers",operator_id:"includes",values:[locId.uuid]}], limit:1})
             });
+            if (!sr.ok) throw new Error(`Search HTTP ${sr.status}`);
             const sd = await sr.json();
             results.push({row, city, region, country, count: sd.count||0, status:"ok", location_matched: locDesc, match_quality: mq, uuid: locId.uuid});
         } catch(err) {
@@ -126,17 +124,29 @@ def save_results(by_row: dict):
     return merged
 
 
+def do_login(page, email, password):
+    """Login to Crunchbase. Returns True on success."""
+    print("Logging into Crunchbase...")
+    page.goto("https://www.crunchbase.com/login", wait_until="networkidle")
+    time.sleep(3)
+    page.fill('input[name="email"], input[type="email"]', email)
+    page.fill('input[name="password"], input[type="password"]', password)
+    page.click('button[type="submit"]')
+    page.wait_for_url("**/home**", timeout=30000)
+    print("Login successful!")
+    return True
+
+
 def main():
     parser = argparse.ArgumentParser(description="Crunchbase scraper via Playwright")
-    parser.add_argument("--email", help="Crunchbase email")
-    parser.add_argument("--password", help="Crunchbase password")
-    parser.add_argument("--resume", action="store_true", help="Resume from saved browser state")
-    parser.add_argument("--start-batch", type=int, default=0, help="Start from batch N")
+    parser.add_argument("--email", help="Crunchbase email (for local login)")
+    parser.add_argument("--password", help="Crunchbase password (for local login)")
+    parser.add_argument("--resume", action="store_true", help="Use saved browser_state.json (no login)")
     parser.add_argument("--headless", action="store_true", help="Run headless")
     args = parser.parse_args()
 
     if not args.resume and (not args.email or not args.password):
-        print("Error: --email and --password required (or use --resume)")
+        print("Error: --email and --password required, or use --resume with browser_state.json")
         sys.exit(1)
 
     cities = load_cities()
@@ -144,45 +154,42 @@ def main():
     print(f"Loaded {len(cities)} cities in {len(batches)} batches")
 
     existing = load_existing_results()
-    print(f"Existing results: {len(existing)} cities")
+    # Remove any error results so they get retried
+    existing = {k: v for k, v in existing.items() if v.get("status") != "error"}
+    print(f"Existing OK results: {len(existing)} cities")
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=args.headless)
+        browser = p.chromium.launch(
+            headless=args.headless,
+            args=["--disable-blink-features=AutomationControlled", "--no-sandbox"]
+        )
 
         if args.resume and STATE_FILE.exists():
-            context = browser.new_context(storage_state=str(STATE_FILE))
-            print("Restored browser state")
+            context = browser.new_context(
+                storage_state=str(STATE_FILE),
+                user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            )
+            print("Restored browser state from cookies")
         else:
-            context = browser.new_context()
+            context = browser.new_context(
+                user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            )
 
         page = context.new_page()
+        page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
 
         if not args.resume:
-            # Login
-            print("Logging into Crunchbase...")
-            page.goto("https://www.crunchbase.com/login", wait_until="networkidle")
-            time.sleep(2)
-
-            page.fill('input[name="email"], input[type="email"]', args.email)
-            page.fill('input[name="password"], input[type="password"]', args.password)
-            page.click('button[type="submit"]')
-
-            page.wait_for_url("**/home**", timeout=30000)
-            print("Login successful!")
-
-            # Save browser state for resume
+            do_login(page, args.email, args.password)
             OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
             context.storage_state(path=str(STATE_FILE))
-            print(f"Browser state saved to {STATE_FILE}")
         else:
             page.goto("https://www.crunchbase.com/home", wait_until="networkidle")
             time.sleep(2)
 
-        # Process batches
-        for batch_idx in range(args.start_batch, len(batches)):
+        for batch_idx in range(len(batches)):
             batch = batches[batch_idx]
 
-            # Skip if all cities in this batch already have results
+            # Skip fully completed batches
             batch_rows = {c["row"] for c in batch}
             if batch_rows.issubset(existing.keys()):
                 ok_count = sum(1 for r in batch_rows if existing[r].get("status") == "ok")
@@ -190,32 +197,42 @@ def main():
                     print(f"Batch {batch_idx} already complete, skipping")
                     continue
 
-            print(f"\n=== Batch {batch_idx}/{len(batches)-1}: {len(batch)} cities (rows {batch[0]['row']}-{batch[-1]['row']}) ===")
+            # Only send cities that don't have OK results yet
+            cities_to_scrape = [c for c in batch if c["row"] not in existing or existing[c["row"]].get("status") != "ok"]
+
+            print(f"\n=== Batch {batch_idx}/{len(batches)-1}: {len(cities_to_scrape)} cities (rows {batch[0]['row']}-{batch[-1]['row']}) ===")
 
             try:
-                result = page.evaluate(SCRAPE_JS, batch)
+                result = page.evaluate(SCRAPE_JS, cities_to_scrape)
 
+                errors_in_batch = 0
                 for r in result:
                     existing[r["row"]] = r
-                    status_icon = "✓" if r["status"] == "ok" else "✗" if r["status"] == "not_found" else "!"
+                    status_icon = "+" if r["status"] == "ok" else "?" if r["status"] == "not_found" else "!"
                     print(f"  {status_icon} Row {r['row']}: {r['city']} -> {r.get('count', '?')} ({r.get('match_quality', '?')})")
+                    if r["status"] == "error":
+                        errors_in_batch += 1
 
-                # Save after each batch
                 save_results(existing)
                 print(f"  Saved {len(existing)} results total")
 
-                # Save browser state periodically
-                context.storage_state(path=str(STATE_FILE))
+                # If too many errors, session expired — stop
+                if errors_in_batch > len(cities_to_scrape) // 2:
+                    print(f"  SESSION EXPIRED ({errors_in_batch} errors). Need fresh cookies.")
+                    # Remove error results so next run retries them
+                    for r in result:
+                        if r["status"] == "error":
+                            existing.pop(r["row"], None)
+                    save_results(existing)
+                    print("  Stopping. Re-run local login and upload fresh browser_state.json")
+                    browser.close()
+                    sys.exit(2)
 
             except Exception as e:
-                print(f"  ERROR in batch {batch_idx}: {e}")
-                # Try to recover
-                try:
-                    page.goto("https://www.crunchbase.com/home", wait_until="networkidle")
-                    time.sleep(3)
-                except:
-                    print("  Could not recover, stopping")
-                    break
+                print(f"  EXCEPTION in batch {batch_idx}: {e}")
+                print("  Stopping.")
+                browser.close()
+                sys.exit(1)
 
             # Delay between batches
             if batch_idx < len(batches) - 1:
